@@ -1,0 +1,5 @@
+# Never commit Codex credentials or local profile stores
+auth.json
+account-switch/
+.codex/
+*.bak
