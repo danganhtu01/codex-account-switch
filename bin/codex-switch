@@ -1,0 +1,269 @@
+#!/usr/bin/env bash
+#
+# codex-switch — switch between N OpenAI Codex CLI accounts.
+#
+# Codex caches login details in a plaintext file at $CODEX_HOME/auth.json
+# (CODEX_HOME defaults to ~/.codex). This tool snapshots that file under named
+# profiles and swaps the active one in, so you can keep an arbitrary number of
+# Codex accounts side by side and switch between them with one command.
+#
+# Docs: https://developers.openai.com/codex/auth
+#
+set -euo pipefail
+
+VERSION="1.0.0"
+PROG="${0##*/}"
+
+# --- Layout -----------------------------------------------------------------
+CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+AUTH_FILE="$CODEX_HOME/auth.json"
+STORE="${CODEX_SWITCH_HOME:-$CODEX_HOME/account-switch}"
+PROFILES="$STORE/profiles"
+ACTIVE_PTR="$STORE/active"
+BACKUP="$STORE/.auth.json.bak"
+
+# --- Helpers ----------------------------------------------------------------
+c_bold=''; c_dim=''; c_red=''; c_grn=''; c_rst=''
+if [ -t 1 ]; then
+  c_bold=$'\033[1m'; c_dim=$'\033[2m'; c_red=$'\033[31m'; c_grn=$'\033[32m'; c_rst=$'\033[0m'
+fi
+
+err()  { printf '%s%s:%s %s\n' "$c_red" "$PROG" "$c_rst" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+info() { printf '%s\n' "$*"; }
+
+ensure_store() {
+  mkdir -p "$PROFILES"
+  chmod 700 "$STORE" "$PROFILES" 2>/dev/null || true
+}
+
+# Reject anything that could escape the profiles dir.
+valid_name() {
+  local n="$1"
+  case "$n" in
+    ''|.|..)            return 1 ;;
+    -*)                 return 1 ;;   # no leading dash (avoids flag confusion)
+    *[!A-Za-z0-9._-]*)  return 1 ;;   # allowed: letters, digits, . _ -
+    *)                  return 0 ;;
+  esac
+}
+
+require_name() {
+  [ -n "${1:-}" ] || die "missing account name. See: $PROG help"
+  valid_name "$1" || die "invalid account name '$1' (allowed: letters, digits, '.', '_', '-')."
+}
+
+# Hash a file's contents (used to detect which profile is currently active).
+hash_file() {
+  [ -f "$1" ] || return 1
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    # Fallback: size + mtime is good enough to distinguish snapshots.
+    wc -c <"$1" | tr -d ' '
+  fi
+}
+
+profile_dir()  { printf '%s/%s' "$PROFILES" "$1"; }
+profile_auth() { printf '%s/%s/auth.json' "$PROFILES" "$1"; }
+profile_exists() { [ -f "$(profile_auth "$1")" ]; }
+
+list_profiles() {
+  [ -d "$PROFILES" ] || return 0
+  local d
+  for d in "$PROFILES"/*/; do
+    [ -e "$d" ] || continue
+    [ -f "${d}auth.json" ] || continue
+    basename "$d"
+  done | LC_ALL=C sort
+}
+
+# Name of the profile whose auth.json matches the live auth.json, if any.
+detect_active() {
+  local live name
+  live="$(hash_file "$AUTH_FILE" 2>/dev/null || true)"
+  [ -n "$live" ] || { [ -f "$ACTIVE_PTR" ] && cat "$ACTIVE_PTR"; return; }
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    if [ "$(hash_file "$(profile_auth "$name")")" = "$live" ]; then
+      printf '%s\n' "$name"; return
+    fi
+  done < <(list_profiles)
+  # No content match — fall back to the recorded pointer (may be stale).
+  [ -f "$ACTIVE_PTR" ] && cat "$ACTIVE_PTR" || true
+}
+
+# --- Commands ---------------------------------------------------------------
+cmd_add() {
+  local force=0 name=''
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -f|--force) force=1 ;;
+      -*) die "unknown option '$1'" ;;
+      *)  [ -z "$name" ] && name="$1" || die "unexpected argument '$1'" ;;
+    esac
+    shift
+  done
+  require_name "$name"
+  [ -f "$AUTH_FILE" ] || die "no active Codex auth at $AUTH_FILE.
+  Log in first:  ${c_bold}codex login${c_rst}   (then re-run: $PROG add $name)"
+  ensure_store
+  local dest; dest="$(profile_dir "$name")"
+  if profile_exists "$name" && [ "$force" -ne 1 ]; then
+    die "account '$name' already exists. Overwrite with: $PROG add $name --force"
+  fi
+  mkdir -p "$dest"; chmod 700 "$dest" 2>/dev/null || true
+  cp "$AUTH_FILE" "$dest/auth.json"
+  chmod 600 "$dest/auth.json" 2>/dev/null || true
+  printf '%s\n' "$name" >"$ACTIVE_PTR"
+  info "${c_grn}Saved${c_rst} current Codex login as account '${c_bold}$name${c_rst}'."
+}
+
+cmd_list() {
+  local active; active="$(detect_active)"
+  local any=0 name marker
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    any=1
+    if [ "$name" = "$active" ]; then marker="${c_grn}*${c_rst}"; else marker=' '; fi
+    printf ' %s %s\n' "$marker" "$name"
+  done < <(list_profiles)
+  if [ "$any" -eq 0 ]; then
+    info "No saved accounts yet."
+    info "  1) ${c_bold}codex login${c_rst}            # authenticate an account"
+    info "  2) ${c_bold}$PROG add <name>${c_rst}   # save it under a name"
+    return 0
+  fi
+  printf '%s%s active%s\n' "$c_dim" "${active:-none}" "$c_rst"
+}
+
+cmd_use() {
+  require_name "${1:-}"
+  local name="$1"
+  profile_exists "$name" || die "no account named '$name'. See: $PROG list"
+  ensure_store
+  mkdir -p "$CODEX_HOME"
+  # Back up whatever is currently live so a bad switch is recoverable.
+  [ -f "$AUTH_FILE" ] && cp "$AUTH_FILE" "$BACKUP" 2>/dev/null || true
+  cp "$(profile_auth "$name")" "$AUTH_FILE"
+  chmod 600 "$AUTH_FILE" 2>/dev/null || true
+  printf '%s\n' "$name" >"$ACTIVE_PTR"
+  info "${c_grn}Switched${c_rst} to account '${c_bold}$name${c_rst}'."
+}
+
+cmd_current() {
+  local active; active="$(detect_active)"
+  if [ -z "$active" ]; then
+    if [ -f "$AUTH_FILE" ]; then
+      info "Active Codex login is not saved as a profile. Save it: $PROG add <name>"
+    else
+      info "No active Codex login. Run: ${c_bold}codex login${c_rst}"
+    fi
+    return 0
+  fi
+  printf '%s\n' "$active"
+}
+
+cmd_remove() {
+  local force=0 name=''
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -f|--force) force=1 ;;
+      -*) die "unknown option '$1'" ;;
+      *)  [ -z "$name" ] && name="$1" || die "unexpected argument '$1'" ;;
+    esac
+    shift
+  done
+  require_name "$name"
+  profile_exists "$name" || die "no account named '$name'. See: $PROG list"
+  if [ "$force" -ne 1 ]; then
+    if [ -t 0 ]; then
+      printf 'Remove saved account %s? [y/N] ' "'$name'"
+      read -r ans
+      case "$ans" in [yY]*) ;; *) die "Aborted." ;; esac
+    else
+      die "refusing to remove '$name' non-interactively. Pass --force."
+    fi
+  fi
+  rm -rf "$(profile_dir "$name")"
+  [ -f "$ACTIVE_PTR" ] && [ "$(cat "$ACTIVE_PTR")" = "$name" ] && rm -f "$ACTIVE_PTR"
+  info "${c_grn}Removed${c_rst} account '$name'. (Live $AUTH_FILE left untouched.)"
+}
+
+cmd_rename() {
+  require_name "${1:-}"; require_name "${2:-}"
+  local old="$1" new="$2"
+  profile_exists "$old" || die "no account named '$old'. See: $PROG list"
+  profile_exists "$new" && die "account '$new' already exists."
+  ensure_store
+  mv "$(profile_dir "$old")" "$(profile_dir "$new")"
+  if [ -f "$ACTIVE_PTR" ] && [ "$(cat "$ACTIVE_PTR")" = "$old" ]; then
+    printf '%s\n' "$new" >"$ACTIVE_PTR"
+  fi
+  info "${c_grn}Renamed${c_rst} '$old' -> '$new'."
+}
+
+usage() {
+  cat <<EOF
+${c_bold}$PROG${c_rst} — switch between N OpenAI Codex CLI accounts (v$VERSION)
+
+${c_bold}USAGE${c_rst}
+  $PROG <command> [args]
+
+${c_bold}COMMANDS${c_rst}
+  add <name> [--force]     Save the current Codex login as account <name>
+  list | ls                List saved accounts (active marked with *)
+  use <name>               Switch the active account to <name>
+  <name>                   Shorthand for: use <name>
+  current | who            Print the active account name
+  remove <name> [--force]  Delete a saved account (live auth untouched)
+  rename <old> <new>       Rename a saved account
+  help | -h | --help       Show this help
+  version | --version      Print version
+
+${c_bold}TYPICAL FLOW${c_rst}
+  codex login              # authenticate account #1, then:
+  $PROG add work
+  codex login              # authenticate account #2 (re-login), then:
+  $PROG add personal
+  $PROG list
+  $PROG use work           # or just: $PROG work
+
+${c_bold}NOTES${c_rst}
+  • Profiles live in $STORE (override with \$CODEX_SWITCH_HOME).
+  • Operates on \$CODEX_HOME/auth.json (\$CODEX_HOME defaults to ~/.codex).
+  • Requires file-based credential storage. If you use the OS keyring
+    (config.toml: cli_auth_credentials_store = "keyring"), set it to "file"
+    so credentials live in auth.json for switching to work.
+EOF
+}
+
+# --- Dispatch ---------------------------------------------------------------
+main() {
+  local cmd="${1:-help}"
+  [ $# -gt 0 ] && shift || true
+  case "$cmd" in
+    add)               cmd_add "$@" ;;
+    list|ls)           cmd_list "$@" ;;
+    use|switch)        cmd_use "$@" ;;
+    current|who|active) cmd_current "$@" ;;
+    remove|rm|delete)  cmd_remove "$@" ;;
+    rename|mv)         cmd_rename "$@" ;;
+    help|-h|--help)    usage ;;
+    version|--version|-V) printf '%s %s\n' "$PROG" "$VERSION" ;;
+    *)
+      # Shorthand: `codex-switch <name>` == `codex-switch use <name>`
+      if valid_name "$cmd" && profile_exists "$cmd"; then
+        cmd_use "$cmd"
+      else
+        err "unknown command or account '$cmd'"
+        usage >&2
+        exit 1
+      fi
+      ;;
+  esac
+}
+
+main "$@"
