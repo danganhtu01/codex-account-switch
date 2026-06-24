@@ -47,6 +47,46 @@ BINDIR=/somewhere/bin ./install.sh  # install to an explicit directory
 
 ---
 
+## Windows
+
+A native PowerShell port lives in `bin/codex-switch.ps1` — no WSL or bash needed. It runs on
+Windows PowerShell 5.1+ and PowerShell 7+, and behaves identically to the bash command (same
+commands, same `~\.codex\auth.json` swap, same `%CODEX_HOME%` / `%CODEX_SWITCH_HOME%` overrides).
+
+```powershell
+git clone https://github.com/danganhtu01/codex-account-switch.git
+cd codex-account-switch
+.\install.ps1
+```
+
+`install.ps1` copies `codex-switch.ps1` and a `codex-switch.cmd` shim to
+`%LOCALAPPDATA%\codex-switch` and adds it to your user `PATH` (no admin needed). Open a new
+terminal, then use it exactly like the Unix command:
+
+```powershell
+codex login                 # authenticate account #1
+codex-switch add work
+codex login                 # authenticate account #2 (re-login)
+codex-switch add personal
+codex-switch list
+codex-switch use work       # or just: codex-switch work
+```
+
+Install options:
+
+```powershell
+.\install.ps1 -BinDir C:\tools\bin   # install to an explicit directory
+.\install.ps1 -NoPath                # install but don't modify PATH
+```
+
+You can also run it without installing: `pwsh -File bin\codex-switch.ps1 list` (or `powershell -File ...`).
+
+> On Windows, Codex stores credentials at `%USERPROFILE%\.codex\auth.json`. The same
+> file-based-storage requirement applies — if `config.toml` sets
+> `cli_auth_credentials_store = "keyring"`, change it to `"file"`.
+
+---
+
 ## Authenticate (initial setup)
 
 First authenticate each account with the Codex CLI. **The auth command is:**
